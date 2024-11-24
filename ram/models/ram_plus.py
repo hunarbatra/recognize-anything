@@ -1,7 +1,10 @@
 '''
  * The Recognize Anything Plus Model (RAM++)
  * Written by Xinyu Huang
+
+ * batch inference added by Hunar Batra
 '''
+
 import json
 import warnings
 
@@ -337,6 +340,65 @@ class RAM_plus(nn.Module):
 
 
         return tag_output, tag_output_chinese
+
+    def generate_batch_tag(self, images, threshold=0.68):
+        """
+        Generate tags for a batch of images.
+
+        Args:
+            images: torch.Tensor of shape (batch_size, 3, image_size, image_size)
+            threshold: float, tagging threshold for classification
+
+        Returns:
+            List of dictionaries with tags and their Chinese equivalents for each image.
+        """
+        label_embed = torch.nn.functional.relu(self.wordvec_proj(self.label_embed))
+
+        # Process images through the visual encoder
+        image_embeds = self.image_proj(self.visual_encoder(images))
+        image_atts = torch.ones(image_embeds.size()[:-1],
+                                dtype=torch.long).to(images.device)
+
+        # Recognize tags using the image-tag recognition decoder
+        image_cls_embeds = image_embeds[:, 0, :]
+        image_spatial_embeds = image_embeds[:, 1:, :]
+
+        batch_size = image_spatial_embeds.shape[0]
+        label_embed = label_embed.unsqueeze(0).repeat(batch_size, 1, 1)
+
+        tagging_embed = self.tagging_head(
+            encoder_embeds=label_embed,
+            encoder_hidden_states=image_embeds,
+            encoder_attention_mask=image_atts,
+            return_dict=False,
+            mode='tagging',
+        )
+
+        logits = self.fc(tagging_embed[0]).squeeze(-1)
+
+        # Apply threshold to get tag predictions
+        targets = torch.where(
+            torch.sigmoid(logits) > self.class_threshold.to(images.device),
+            torch.tensor(1.0).to(images.device),
+            torch.zeros(self.num_class).to(images.device))
+
+        # Convert predictions to numpy arrays
+        tag_matrix = targets.cpu().numpy()
+        tag_matrix[:, self.delete_tag_index] = 0
+
+        # Generate tags for each image in the batch
+        batch_tags = []
+        for i in range(batch_size):
+            indices = np.argwhere(tag_matrix[i] == 1).flatten()
+            english_tags = self.tag_list[indices]
+            chinese_tags = self.tag_list_chinese[indices]
+
+            batch_tags.append({
+                "tags": ' | '.join(english_tags),
+                "tags_chinese": ' | '.join(chinese_tags)
+            })
+
+        return batch_tags
 
     def generate_tag_openset(self,
                  image,
