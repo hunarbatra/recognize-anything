@@ -341,64 +341,87 @@ class RAM_plus(nn.Module):
 
         return tag_output, tag_output_chinese
 
-    def generate_batch_tag(self, images, threshold=0.68):
+    def generate_batch_tag(self, image_batch, threshold=0.68):
         """
         Generate tags for a batch of images.
-
+    
         Args:
-            images: torch.Tensor of shape (batch_size, 3, image_size, image_size)
-            threshold: float, tagging threshold for classification
-
+            image_batch (torch.Tensor): Batch of images (batch_size, 3, H, W).
+            threshold (float): Tagging threshold for classification.
+    
         Returns:
-            List of dictionaries with tags and their Chinese equivalents for each image.
+            tag_output (list[str]): List of tags (English) for each image.
+            tag_output_chinese (list[str]): List of tags (Chinese) for each image.
         """
-        label_embed = torch.nn.functional.relu(self.wordvec_proj(self.label_embed))
-
-        # Process images through the visual encoder
-        image_embeds = self.image_proj(self.visual_encoder(images))
-        image_atts = torch.ones(image_embeds.size()[:-1],
-                                dtype=torch.long).to(images.device)
-
-        # Recognize tags using the image-tag recognition decoder
+        # Generate image embeddings
+        image_embeds = self.image_proj(self.visual_encoder(image_batch))
+        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image_batch.device)
+    
+        # Separate CLS and spatial embeddings
         image_cls_embeds = image_embeds[:, 0, :]
         image_spatial_embeds = image_embeds[:, 1:, :]
-
-        batch_size = image_spatial_embeds.shape[0]
-        label_embed = label_embed.unsqueeze(0).repeat(batch_size, 1, 1)
-
-        tagging_embed = self.tagging_head(
+        batch_size = image_cls_embeds.size(0)
+    
+        # Class descriptors
+        des_per_class = int(self.label_embed.shape[0] / self.num_class)
+    
+        # Normalize CLS embeddings
+        image_cls_embeds = image_cls_embeds / image_cls_embeds.norm(dim=-1, keepdim=True)
+        reweight_scale = self.reweight_scale.exp()
+    
+        # Compute logits per image and reshape for weight normalization
+        logits_per_image = (reweight_scale * image_cls_embeds @ self.label_embed.t())
+        logits_per_image = logits_per_image.view(batch_size, -1, des_per_class)
+    
+        # Compute weight normalization and reweight label embeddings
+        weight_normalized = F.softmax(logits_per_image, dim=2)
+        reshaped_label_embed = self.label_embed.view(-1, des_per_class, 512)
+    
+        # Batched reweighting
+        label_embed_reweight = torch.einsum(
+            'bij,ijd->bid',
+            weight_normalized,
+            reshaped_label_embed
+        )
+    
+        # Pass reweighted embeddings through word vector projection
+        label_embed = torch.nn.functional.relu(self.wordvec_proj(label_embed_reweight))
+    
+        # Use tagging head to generate logits
+        tagging_output = self.tagging_head(
             encoder_embeds=label_embed,
             encoder_hidden_states=image_embeds,
             encoder_attention_mask=image_atts,
             return_dict=False,
             mode='tagging',
         )
-
-        logits = self.fc(tagging_embed[0]).squeeze(-1)
-
-        # Apply threshold to get tag predictions
-        targets = torch.where(
-            torch.sigmoid(logits) > self.class_threshold.to(images.device),
-            torch.tensor(1.0).to(images.device),
-            torch.zeros(self.num_class).to(images.device))
-
-        # Convert predictions to numpy arrays
-        tag_matrix = targets.cpu().numpy()
-        tag_matrix[:, self.delete_tag_index] = 0
-
-        # Generate tags for each image in the batch
-        batch_tags = []
+    
+        # Compute logits and apply thresholds
+        logits = self.fc(tagging_output[0]).squeeze(-1)
+        probabilities = torch.sigmoid(logits)
+        class_thresholds = self.class_threshold.to(image_batch.device)
+        predictions = (probabilities > class_thresholds).float()
+    
+        # Convert predictions to tag lists
+        tag_predictions = predictions.cpu().numpy()
+        tag_predictions[:, self.delete_tag_index] = 0  # Remove unwanted tags
+    
+        tag_output = []
+        tag_output_chinese = []
+    
         for i in range(batch_size):
-            indices = np.argwhere(tag_matrix[i] == 1).flatten()
+            # Find indices of predicted tags
+            indices = np.argwhere(tag_predictions[i] == 1).flatten()
+    
+            # Retrieve tags in English and Chinese
             english_tags = self.tag_list[indices]
             chinese_tags = self.tag_list_chinese[indices]
-
-            batch_tags.append({
-                "tags": ' | '.join(english_tags),
-                "tags_chinese": ' | '.join(chinese_tags)
-            })
-
-        return batch_tags
+    
+            # Join tags and add to output
+            tag_output.append(' | '.join(english_tags))
+            tag_output_chinese.append(' | '.join(chinese_tags))
+    
+        return tag_output, tag_output_chinese
 
     def generate_tag_openset(self,
                  image,
